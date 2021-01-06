@@ -1,0 +1,519 @@
+#!/bin/bash
+# vim: set filetype=sh:
+set -o nounset;  # Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+set -o pipefail; # Catch the error in case mysqldump fails (but gzip succeeds) in `mysqldump |gzip`
+set -o errexit;  # Exit on error. Append "|| true" if you expect an error.
+# set -o errtrace; # Exit on error inside any functions or subshells.
+# set -o xtrace;   # Turn on traces, useful while debugging but commented out by default
+
+readonly SCRIPTNAME=$(basename "$0")
+readonly SCRIPTDIR=$(readlink -m "$(dirname "$0")")
+
+# -----------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------
+# These are based on personal preferences.
+# You can override any of these by setting the environment variable outside this script.
+
+# MANDATORY, you must set this to the location of your notes:
+NOTES_DIR=${NOTES_DIR:-~/Dropbox/Notes}
+
+# The main search command.
+# If empty, will choose from rg or ag if installed.
+NOTES_SEARCH_CMD=${NOTES_SEARCH_CMD:-""}
+
+# The command used to search for file names.
+# If empty, will choose from fd (recommended), rg, or ag if installed.
+NOTES_FILENAME_SEARCH_CMD=${NOTES_FILENAME_SEARCH_CMD:-""}
+
+PAGER=${PAGER:-less}
+PAGER_OPTS=${PAGER_OPTS:-}
+if [ "$PAGER" = "less" ]; then
+  PAGER_OPTS=-FRX
+fi
+NOTES_EDITOR=${EDITOR:-vim}
+NOTES_EDITOR2=${NOTES_EDITOR2:-typora}
+NOTES_LAUNCHCMD=${NOTES_LAUNCHCMD:-md2strapdown.sh}
+
+NOTES_SEARCH_ARGS=${NOTES_SEARCH_ARGS:-""}
+DEBUG=
+
+# -----------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------
+
+help() {
+cat<<EOF
+This is a simple note manager scripte which searches/lists/edits notes contained 
+within the \$NOTES_DIR [${NOTES_DIR}]. 
+
+Pre-requsisite: Either ripgrep ('rg') or the_silver_searcher ('ag') is required to be installed.
+                'fd' is used for path-level searches, if installed
+
+USAGE:
+
+There are four modes: 1) view file, 2) search, 3) recents, and 4) new note
+
+1. View file mode
+
+    $SCRIPTNAME ?-e|--edit,-b|--launch? <path to note file(s)>
+    <path to note file> : is a path to a note file. Either a full path or a relative path
+                          from the \$NOTES_DIR
+
+    <options>:
+      -e|--edit   : edit notes (using \$EDITOR, default vim)
+      -e2|--edit2 : edit notes using 2nd editor (using \$NOTES_EDITOR2, default typora)
+      --editor <editor> : edit notes using supplied editor
+      -b|--launch : launch markdown conversion and show in browser
+
+2. Search mode
+
+Search mode is initiated by using one of these options: -s, -t, -l (or their full command name).
+
+    $SCRIPTNAME <command> ?ag options? <search expr>
+    <commmand> is one of:
+      -s|--search|--grep|--ag: search for expr in notes directory (like grep)
+      -e|--edit : edit all found notes, preloading the search (if EDITOR is vim)
+      -v|--view : view all found notes in pager, preloading the search (if PAGER is less)
+      -t|--title : list all matching files (in titles only)
+      -l|--list: list all matching files
+      -h|--help: this help
+
+    ?ag options? relevant options passed through to ag. e.g.: '--markdown'
+
+    <search expr> is a search expression, passed through to 'ag'.
+
+3. Recents mode
+
+    $SCRIPTNAME -r|--recent|--history <num files to display>
+      -r|--recent|--history <num_files>: list recent files.
+                             num_files is the number of files to display [default: shows all, in pager]
+4. New note mode
+
+    $SCRIPTNAME -n|--new ?partial path to note file?
+      ?partial path to note file?: Either the subdirectory (under \$NOTES_DIR) or the
+                                   subdirectory plus filename to create
+    You are prompted to edit the note filename before the editor is launched
+EOF
+exit 1
+}
+
+# -----------------------------------------------------------------
+
+die() { >&2 colorecho red "FATAL: $*"; exit 1; }
+die_with_rc() { local rc=$1; shift; >&2 colorecho red "FATAL: $*, rc=$rc"; exit "$rc"; }
+check_rc_die() { local rc=$1; shift; [ "$rc" -ne 0 ] && die_with_rc "$rc" "$@"; }
+log_error() { >&2 colorecho red "ERROR: $*"; }
+log_warn() { >&2 colorecho orange "$*"; }
+log_info() { >&2 echo "$*"; }
+log_debug() { if [ -n "$DEBUG" ]; then >&2 echo "DEBUG: $*"; fi; }
+log_progress() { >&2 colorecho green "$*"; }
+
+colorecho() {  # usage: colorecho <colour> <text>
+  local colour="$1"; shift
+  case "${colour}" in
+    red) echo -e "$(tput setaf 1)$*$(tput sgr0)"; ;;
+    green) echo -e "$(tput setaf 2)$*$(tput sgr0)"; ;;
+    green-bold) echo -e "$(tput setaf 2; tput bold)$*$(tput sgr0)"; ;;
+    yellow) echo -e "$(tput setaf 3; tput bold)$*$(tput sgr0)"; ;;
+    orange) echo -e "$(tput setaf 3)$*$(tput sgr0)"; ;;
+    blue) echo -e "$(tput setaf 4)$*$(tput sgr0)"; ;;
+    purple) echo -e "$(tput setaf 5)$*$(tput sgr0)"; ;;
+    cyan) echo -e "$(tput setaf 6)$*$(tput sgr0)"; ;;
+    bold) echo -e "$(tput bold)$*$(tput sgr0)"; ;;
+    normal|*) echo -e "$*"; ;;
+  esac
+}
+
+prompt_val() {
+  # prompts for value with optional default
+  local promptstr=${1:-"Enter value"}
+  local defaultval=${2:-""}
+  local response
+  if [ "${BASH_VERSINFO[0]}" -ge 4 ]; then
+    read -r -e -p "${promptstr}: " -i "$defaultval" response
+  else
+    if [ -z "$defaultval" ]; then
+      >&2 echo -n "${promptstr}: "
+    else
+      >&2 echo -n "${promptstr} [$defaultval]: "
+    fi
+    read -r response
+  fi
+  if [ -z "$response" ]; then
+    response="$defaultval"
+  fi
+  echo "$response"
+}
+
+_searchcmd() {
+  local cmd_arg="$1"
+  local search_arg="$2"
+  log_debug "_searchcmd cmd_ars:$cmd_arg NOTES_SEARCH_ARGS:$NOTES_SEARCH_ARGS search_arg:$search_arg"
+  local search_match
+  local f
+  #declare -a search_match
+  if [ "$NOTES_SEARCH_CMD" = rg ]; then
+    # shellcheck disable=SC2086
+    while IFS= read -r -d '' f; do
+      search_match+=("$f")
+    done < <(rg $NOTES_SEARCH_ARGS --null --color never --files-with-matches "$search_arg")
+  else
+    while IFS= read -r -d '' f; do
+      search_match+=("$f")
+    done < <(ag "$NOTES_SEARCH_ARGS" --null --nocolor --files-with-matches "$search_arg")
+  fi
+  log_debug "search_match:${search_match[*]}"
+  if [ -z "${search_match[*]}" ]; then
+    echo "No matching files."
+    exit 0
+  fi
+  printf "Files:\\n%s\\n" "${search_match[*]}"
+  # TODO ensure this works for files with spaces (it prob doesn't right now):
+  if [ "$(basename "$cmd_arg")" = "vim" ] || [ "$(basename "$cmd_arg")" = "less" ] ; then
+    #echo "${search_match[*]}" | xargs "$cmd_arg" --not-a-term +/"$search_arg"
+    # shellcheck disable=SC2086
+    $cmd_arg +/"$search_arg" ${search_match[*]}
+  else
+    $cmd_arg "${search_match[*]}"
+  fi
+}
+
+
+# -----------------------------------------------------------------
+# Command functions
+# -----------------------------------------------------------------
+
+### File Mode
+
+file_view() {
+  log_debug "Executing: file_view $*"
+  local action=$1
+  shift
+  if [ "$action" = "edit" ]; then
+    $NOTES_EDITOR "$@"
+  elif [ "$action" = "edit2" ]; then
+    $NOTES_EDITOR2 "$@"
+  elif [ "$action" = "launch" ]; then
+    $NOTES_LAUNCHCMD "$@"
+  else
+    $PAGER $PAGER_OPTS "$@"
+  fi
+}
+
+### New note
+
+# get_subdir() {
+#   local subdir=${1:-""}
+#   local default_subdir=${2:-"capture"}
+#   if [ -z "$subdir" ]; then
+#     # subdir=$(prompt_val "Note subdirectory (in $NOTES_DIR)" "$default_subdir")
+#     subdir=$default_subdir
+#   fi
+#   echo "$subdir"
+# }
+
+make_title() {
+  local title=${1:-""}
+  local subtitle=${2:-""}
+  if [ -z "$title" ]; then
+    title=$(date '+%Y%m%d-%H%M%S')
+  fi
+  if [ -z "$subtitle" ]; then
+    title="${title}"
+  else
+    title="${title}-${subtitle}"
+  fi
+  # add .md extension if necessary
+  if [ "$(basename "$title" .md)" = "$(basename "$title")" ]; then
+    title="${title}.md"
+  fi
+  echo "$title"
+}
+
+do_create_note() { 
+  # we may have been passed in:
+  # 1. nothing
+  # 2. subdir - a subdirectory of $NOTES_DIR
+  # 3. a full path to a new note
+  local subdir="capture"
+  local notefile=""
+  local firstarg=${1:-""}
+  if [ -z "$firstarg" ]; then
+    # case 1: nothing
+    log_debug "do_create_note: no args"
+  else
+    if [ -d "$firstarg" ]; then
+      # case 2. subdir - a subdirectory of $NOTES_DIR
+      subdir=$firstarg
+      log_debug "do_create_note: subdir=$subdir"
+    else
+      subdir=$(dirname "$firstarg")
+      if [ -n "$subdir" ]; then
+        notefile=$(basename "$firstarg")
+      fi
+      log_debug "do_create_note: subdir=$subdir notefile=$notefile"
+    fi
+  fi
+
+  #subdir=$(get_subdir "$subdir")
+  local dir="${NOTES_DIR}/${subdir}"
+  [ -d "$dir" ] || die "Directory does not exist: $dir"
+
+  local notepath
+  notepath="$dir/$(make_title "$notefile")"
+  notepath=$(prompt_val "Create new note" "$notepath")
+  [ -d "$(dirname "$notepath")" ] || die "Directory does not exist: $(dirname "$notepath")"
+  log_info "Creating ${notepath}..."
+  "$EDITOR" "$notepath"
+}
+
+### Search Mode
+
+search_search() {
+  log_debug "Executing: search_search $*"
+  # shellcheck disable=SC2086
+  $NOTES_SEARCH_CMD $NOTES_SEARCH_ARGS "$@"
+}
+
+search_edit() {
+  log_debug "Executing: search_edit $*"
+  _searchcmd "$NOTES_EDITOR" "$@"
+}
+
+# typora doesn't support multiple command-line arguments, so this isn't supported:
+#search_edit2()
+#{
+#  log_debug "Executing: search_edit2 $*"
+#  _searchcmd "$NOTES_EDITOR2" "$@"
+#}
+
+search_view() {
+  log_debug "Executing: search_view $*"
+  _searchcmd "$PAGER" "$@"
+}
+
+
+# shellcheck disable=SC2086
+search_list() {
+  log_debug "Executing: search_list $*"
+  if [ -n "$NOTES_FILENAME_SEARCH_CMD" ]; then
+    if [ "$NOTES_FILENAME_SEARCH_CMD" = fd ]; then
+      if [ -z "$*" ]; then
+        fd $NOTES_SEARCH_ARGS --color never '.*'
+      else
+        fd $NOTES_SEARCH_ARGS --color never '$@'
+      fi
+    else
+      # have at it and hope it works:
+      "$NOTES_FILENAME_SEARCH_CMD" "$@"
+    fi
+  elif [ "$NOTES_SEARCH_CMD" = rg ]; then
+    if [ -z "$*" ]; then
+      rg $NOTES_SEARCH_ARGS --color never --files-with-matches '.*'
+    else
+      rg $NOTES_SEARCH_ARGS --color never --files-with-matches "$@"
+    fi
+  elif [ "$NOTES_SEARCH_CMD" = ag ]; then
+    ag $NOTES_SEARCH_ARGS --nocolor --files-with-matches "$@"
+  fi
+}
+
+# shellcheck disable=SC2086
+search_titles() {
+  log_debug "Executing: search_titles $*"
+  if [ -n "$NOTES_FILENAME_SEARCH_CMD" ]; then
+    if [ "$NOTES_FILENAME_SEARCH_CMD" = fd ]; then
+      log_debug "Using fd"
+      fd $NOTES_SEARCH_ARGS --color never --full-path "$@"
+    else
+      # have at it and hope it works:
+      "$NOTES_FILENAME_SEARCH_CMD" "$@"
+    fi
+  elif [ "$NOTES_SEARCH_CMD" = rg ]; then
+    # --files: prints out files, --glob is a glob expression of files to include
+    # shellcheck disable=SC2145
+    rg $NOTES_SEARCH_ARGS --color never --files --glob '*'"$@"'*'
+  elif [ "$NOTES_SEARCH_CMD" = ag ]; then
+    ag $NOTES_SEARCH_ARGS --nocolor --files-with-matches --filename-pattern "$@"
+  fi
+}
+
+### Search Mode
+
+recent_files() {
+  log_debug "Executing: recent_files $*"
+  local num_files=${1:-""}
+
+  # see http://superuser.com/questions/294161/unix-linux-find-and-sort-by-date-modified
+  # the '-type d -name '.git' -prune -o' filters out .git directory
+  if [ -z "$num_files" ]; then
+    find . -type d -name '.git' -prune -o -type f -printf "%T@ %Tc %p\\n" | sort -nr | awk '{$1=""; print $0;}' | less -FRX
+  else
+    find . -type d -name '.git' -prune -o -type f -printf "%T@ %Tc %p\\n" | sort -nr | awk '{$1=""; print $0;}' | head -n "$num_files"
+  fi
+}
+
+# -----------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------
+
+main() {
+  if [ ! -d "$NOTES_DIR" ]; then
+    echo "ERROR: NOTES_DIR directory does not exist: $NOTES_DIR"
+    exit 1
+  fi
+  cd "$NOTES_DIR"
+
+  if [ $# -le 0 ] ; then
+    echo "Incorrect arguments. Use -h|--help for help"
+    help
+  fi
+
+  if [ -z "$NOTES_SEARCH_CMD" ]; then
+    if hash rg; then
+      NOTES_SEARCH_CMD=rg
+    elif hash ag; then
+      NOTES_SEARCH_CMD=ag
+    else
+      die "Can't find 'fd', 'rg', or 'ag'. This script recommends 'fd', and requires either 'ripgrep' or 'the_silver_searcher' to be installed."
+    fi
+    export NOTES_SEARCH_CMD
+  fi
+  if [ -z "$NOTES_FILENAME_SEARCH_CMD" ]; then
+    if hash fd; then
+      NOTES_FILENAME_SEARCH_CMD=fd
+    else
+      # fall back to either rg or ag since they can both accomplish the same (just slower than fd)
+      NOTES_FILENAME_SEARCH_CMD=$NOTES_SEARCH_CMD
+    fi
+  fi
+
+  # mode is either 'file' or 'search'
+  local cmd_mode=file
+
+  local arg_e=
+  local arg_e2=
+  local arg_v=
+  local arg_l=
+  local arg_t=
+  local arg_r=
+  local arg_n=
+  local arg_launch=
+  local cmd_func=
+  local foundarg=1
+  while [ $foundarg -ne 0 ]; do
+    case "${1:-""}" in
+    -h|--help)
+      help
+      ;;
+    -D)
+      DEBUG=true
+      set -o xtrace  # Turn on traces
+      shift
+      ;;
+    -s|--search|--grep|--ag|--rg)
+      cmd_mode=search
+      shift
+      ;;
+    -e|--edit)
+      arg_e=1
+      shift
+      ;;
+    -e2|--edit2|--fancyedit)
+      arg_e2=1
+      shift
+      ;;
+    --editor)
+      arg_e=1
+      shift
+      NOTES_EDITOR=$1
+      shift
+      ;;
+    -b|--launch)
+      arg_launch=1
+      shift
+      ;;
+    -v|--view)
+      arg_v=1
+      shift
+      ;;
+    -l|--list)
+      arg_l=1
+      cmd_mode=search
+      shift
+      ;;
+    -n|--new)
+      cmd_mode=newnote
+      shift
+      ;;
+    -t|--title)
+      arg_t=1
+      cmd_mode=search
+      shift
+      ;;
+    -r|--recent|--history)
+      arg_r=1
+      cmd_mode=search
+      shift
+      ;;
+    -*)
+      # pass this through to the search
+      NOTES_SEARCH_ARGS="$NOTES_SEARCH_ARGS $1"
+      shift
+      ;;
+    *)
+      foundarg=0
+      ;;
+    esac
+  done
+
+  #if [ -z "$cmd_func" ]; then
+  #  echo "ERROR: invalid arguments"
+  #  help
+  #fi
+
+  log_debug "cmd_mode:'$cmd_mode' NOTES_SEARCH_ARGS:$NOTES_SEARCH_ARGS remaining:'$*'"
+
+  # The action we end up taking depends on which mode we are in: search or file
+  #
+  if [ "$cmd_mode" = "newnote" ]; then
+    do_create_note "${1-""}"
+
+  elif [ "$cmd_mode" = "search" ]; then
+    cmd_func=search_search
+    if [ -n "$arg_e" ]; then
+      cmd_func=search_edit
+    elif [ -n "$arg_e2" ]; then
+      #cmd_func=search_edit2
+      echo "Secondary editor is not supported for search"
+      exit 1
+    elif [ -n "$arg_v" ]; then
+      cmd_func=search_view
+    elif [ -n "$arg_l" ]; then
+      cmd_func=search_list
+    elif [ -n "$arg_t" ]; then
+      cmd_func=search_titles
+    elif [ -n "$arg_r" ]; then
+      cmd_func=recent_files
+    fi
+    $cmd_func "$@"
+  else
+    cmd_func=file_view
+    file_view_arg=view
+    if [ -n "$arg_e" ]; then
+      file_view_arg=edit
+    elif [ -n "$arg_e2" ]; then
+      file_view_arg=edit2
+    elif [ -n "$arg_launch" ]; then
+      file_view_arg=launch
+    fi
+    $cmd_func $file_view_arg "$@"
+  fi
+}
+
+# Execute main if script is executed directly (not sourced):
+# This allows for shunit2 testing (https://github.com/kward/shunit2)
+if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
+  main "$@"
+fi
